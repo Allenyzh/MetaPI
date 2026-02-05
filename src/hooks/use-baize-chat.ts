@@ -3,6 +3,72 @@ import { streamText, stepCountIs } from "ai";
 import { createGoogleGenerativeAI } from "@ai-sdk/google";
 import { createOpenAI } from "@ai-sdk/openai";
 import { tools } from "../lib/tools";
+import getSlidingWindow from "../lib/getSlidingWindow";
+
+// 默认保留的对话轮数
+const DEFAULT_MAX_ROUNDS = 3;
+
+// 标准化工具输出格式
+const normalizeToolOutput = (output: any) => {
+  if (
+    output &&
+    typeof output === "object" &&
+    "type" in output &&
+    "value" in output
+  ) {
+    return output;
+  }
+  return typeof output === "string"
+    ? { type: "text", value: output }
+    : { type: "json", value: output ?? null };
+};
+
+// 根据模型创建对应的 provider
+const createProvider = (config: {
+  apiKey: string;
+  baseUrl: string;
+  model: string;
+}) => {
+  const isOpenAI = config.model.includes("gpt");
+  const createFn = isOpenAI ? createOpenAI : createGoogleGenerativeAI;
+  return createFn({
+    apiKey: config.apiKey,
+    baseURL: config.baseUrl || undefined,
+  });
+};
+
+// 获取系统提示词
+const getSystemPrompt = (language: string) => {
+  return language === "zh"
+    ? "你是 MatePI，一个强大的浏览器AI助手。你可以读取网页内容，点击按钮，输入文字。请根据用户需求使用工具。"
+    : "You are MatePI, a powerful browser AI assistant. You can read page content, click buttons, and input text. Use tools as needed to fulfill user requests.";
+};
+
+// 构建 assistant 消息内容
+const buildAssistantContent = (
+  accumulatedText: string,
+  toolCalls: Record<string, any>,
+) => {
+  const hasToolCalls = Object.keys(toolCalls).length > 0;
+
+  if (!hasToolCalls) {
+    return accumulatedText;
+  }
+
+  const contentParts: any[] = [];
+  if (accumulatedText) {
+    contentParts.push({ type: "text", text: accumulatedText });
+  }
+  Object.values(toolCalls).forEach((tc) => {
+    contentParts.push({
+      type: "tool-call",
+      toolCallId: tc.toolCallId,
+      toolName: tc.toolName,
+      input: tc.input,
+    });
+  });
+  return contentParts;
+};
 
 export function useBaizeChat() {
   const [messages, setMessages] = useState<any[]>([]);
@@ -33,6 +99,7 @@ export function useBaizeChat() {
 
   const sendMessage = useCallback(
     async (text: string, attachments?: File[]) => {
+      // 验证输入，如果没有文本和附件，或者配置缺失则返回
       if (
         (!text.trim() && (!attachments || attachments.length === 0)) ||
         !config
@@ -41,6 +108,7 @@ export function useBaizeChat() {
 
       setIsLoading(true);
 
+      // 构建用户消息内容
       const contentParts: any[] = [];
       if (text.trim()) {
         contentParts.push({ type: "text", text: text });
@@ -65,53 +133,22 @@ export function useBaizeChat() {
       setInput("");
 
       try {
-        let provider;
-        if (config.model.includes("gpt")) {
-          provider = createOpenAI({
-            apiKey: config.apiKey,
-            baseURL: config.baseUrl || undefined,
-          });
-        } else {
-          provider = createGoogleGenerativeAI({
-            apiKey: config.apiKey,
-            baseURL: config.baseUrl || undefined,
-          });
-        }
+        const provider = createProvider(config);
+        const systemPrompt = getSystemPrompt(config.language);
 
-        const systemPrompt =
-          config.language === "zh"
-            ? "你是 MatePI，一个强大的浏览器AI助手。你可以读取网页内容，点击按钮，输入文字。请根据用户需求使用工具。"
-            : "You are MatePI, a powerful browser AI assistant. You can read page content, click buttons, and input text. Use tools as needed to fulfill user requests.";
+        // 使用滑动窗口限制上下文长度
+        const historyMessages = getSlidingWindow(messages, DEFAULT_MAX_ROUNDS);
+        console.log(historyMessages);
 
         const result = streamText({
           model: provider(config.model),
           system: systemPrompt,
-          messages: [...messages, userMessage] as any,
+          messages: [...historyMessages, userMessage] as any,
           tools: tools,
           stopWhen: stepCountIs(5),
-          onStepFinish({
-            text,
-            toolCalls,
-            toolResults,
-            finishReason,
-            usage,
-          }: any) {
+          onStepFinish({ toolResults }: any) {
             console.log(toolResults);
             if (!toolResults || toolResults.length === 0) return;
-
-            const normalizeToolOutput = (output: any) => {
-              if (
-                output &&
-                typeof output === "object" &&
-                "type" in output &&
-                "value" in output
-              ) {
-                return output;
-              }
-              return typeof output === "string"
-                ? { type: "text", value: output }
-                : { type: "json", value: output ?? null };
-            };
 
             const toolModelMessage = {
               role: "tool",
@@ -133,48 +170,25 @@ export function useBaizeChat() {
         setMessages((prev) => [...prev, { role: "assistant", content: "" }]);
 
         for await (const part of result.fullStream) {
+          // 处理流式响应
           if (part.type === "text-delta") {
-            const textDelta = (part as any).text ?? (part as any).delta ?? "";
-            accumulatedText += textDelta;
+            accumulatedText += (part as any).text ?? (part as any).delta ?? "";
           } else if (part.type === "tool-call") {
-            const toolCallPart = part;
-            toolCalls[toolCallPart.toolCallId] = toolCallPart;
+            toolCalls[part.toolCallId] = part;
           }
 
+          // 更新最后一条 assistant 消息
           setMessages((prev) => {
-            const newMessages = [...prev];
-            let assistantIndex = -1;
-            for (let i = newMessages.length - 1; i >= 0; i--) {
-              if (newMessages[i].role === "assistant") {
-                assistantIndex = i;
-                break;
-              }
-            }
-            if (assistantIndex === -1) return newMessages;
-            const assistantMsg = newMessages[assistantIndex];
+            const lastAssistantIndex = prev.findLastIndex(
+              (msg) => msg.role === "assistant",
+            );
+            if (lastAssistantIndex === -1) return prev;
 
-            if (Object.keys(toolCalls).length > 0) {
-              const contentParts: any[] = [];
-              if (accumulatedText)
-                contentParts.push({ type: "text", text: accumulatedText });
-              Object.values(toolCalls).forEach((tc) => {
-                contentParts.push({
-                  type: "tool-call",
-                  toolCallId: tc.toolCallId,
-                  toolName: tc.toolName,
-                  input: tc.input,
-                });
-              });
-              newMessages[assistantIndex] = {
-                ...assistantMsg,
-                content: contentParts,
-              };
-            } else {
-              newMessages[assistantIndex] = {
-                ...assistantMsg,
-                content: accumulatedText,
-              };
-            }
+            const newMessages = [...prev];
+            newMessages[lastAssistantIndex] = {
+              ...newMessages[lastAssistantIndex],
+              content: buildAssistantContent(accumulatedText, toolCalls),
+            };
             return newMessages;
           });
         }
@@ -190,6 +204,8 @@ export function useBaizeChat() {
     },
     [config, messages],
   );
+
+  console.log(messages);
 
   const handleSubmit = useCallback(
     async (e?: React.FormEvent, attachments?: File[]) => {

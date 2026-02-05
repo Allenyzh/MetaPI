@@ -28,7 +28,7 @@ export const tools = {
         });
 
         const data = response;
-        return `Content (page body):\n\n${data.content}`;
+        return `Content Dom Tree (page body):\n\n${data.content}`;
       } catch (e: any) {
         return `Error reading page content: ${e.message}. Is the content script loaded?`;
       }

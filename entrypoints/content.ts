@@ -13,8 +13,9 @@ export default defineContentScript({
             // const turndownService = new TurndownService();
             // const markdown = turndownService.turndown(document.body);
 
+            console.log(document.body);
             sendResponse({
-              content: document.body,
+              content: document.body.outerHTML, // DOM 树的 HTML 字符串
               title: document.title,
               url: window.location.href,
             });
